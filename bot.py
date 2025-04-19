@@ -8,12 +8,11 @@ from telethon import TelegramClient, events
 from telethon.tl.types import Message
 from telethon.errors import MessageNotModifiedError
 import spacy
-from pymongo import MongoClient
-from pymongo.errors import ConnectionError as MongoConnectionError
 from pydantic import BaseModel
 import threading
 import queue
 from nlp_processor import NLPProcessor
+from database import session, Message as DBMessage, ChatConfig as DBChatConfig
 
 # Load environment variables
 load_dotenv()
@@ -31,25 +30,6 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize NLP processor: {e}")
     nlp_processor = None
-
-# MongoDB connection
-try:
-    mongo_uri = os.getenv("MONGODB_URI")
-    if not mongo_uri:
-        raise ValueError("MONGODB_URI environment variable is not set")
-    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
-    # Test the connection
-    client.server_info()
-    db = client.telegram_bot
-    messages_collection = db.messages
-    chat_configs_collection = db.chat_configs
-    logger.info("Successfully connected to MongoDB")
-except MongoConnectionError as e:
-    logger.error(f"MongoDB connection error: {e}")
-    raise
-except Exception as e:
-    logger.error(f"Unexpected error connecting to MongoDB: {e}")
-    raise
 
 class TagConfig(BaseModel):
     tag: str
@@ -79,11 +59,12 @@ class ChatManager:
     def load_chat_configs(self):
         """Загружает конфигурации чатов из базы данных"""
         try:
-            configs = chat_configs_collection.find({})
+            configs = session.query(DBChatConfig).all()
             for config in configs:
-                chat_id = config['chat_id']
+                chat_id = config.chat_id
                 self.tag_configs[chat_id] = [
-                    TagConfig(**tag_config) for tag_config in config.get('tag_configs', [])
+                    TagConfig(tag=tag, field=field, is_active=True)
+                    for tag, field in config.tags.items()
                 ]
         except Exception as e:
             logger.error(f"Error loading chat configs: {e}")
@@ -91,16 +72,16 @@ class ChatManager:
     def save_chat_config(self, chat_id: int):
         """Сохраняет конфигурацию чата в базу данных"""
         try:
-            chat_configs_collection.update_one(
-                {'chat_id': chat_id},
-                {'$set': {
-                    'chat_id': chat_id,
-                    'tag_configs': [tag.dict() for tag in self.tag_configs.get(chat_id, [])]
-                }},
-                upsert=True
-            )
+            config = session.query(DBChatConfig).filter_by(chat_id=chat_id).first()
+            if not config:
+                config = DBChatConfig(chat_id=chat_id)
+                session.add(config)
+            
+            config.tags = {tag.tag: tag.field for tag in self.tag_configs.get(chat_id, [])}
+            session.commit()
         except Exception as e:
             logger.error(f"Error saving chat config: {e}")
+            session.rollback()
 
     async def handle_config_command(self, event: events.NewMessage.Event):
         """Обрабатывает команду /config"""
@@ -331,11 +312,11 @@ class MessageProcessor:
 
     def check_duplicates(self, data: Dict, chat_id: int) -> bool:
         # Check for duplicates based on key fields
-        existing = messages_collection.find_one({
-            "chat_id": chat_id,
-            "date": data.get("date"),
-            "address": data.get("address")
-        })
+        existing = session.query(DBMessage).filter_by(
+            chat_id=chat_id,
+            date=data.get("date"),
+            address=data.get("address")
+        ).first()
         return existing is not None
 
     def process_queue(self):
@@ -367,16 +348,19 @@ class MessageProcessor:
                     continue
 
                 # Save to database
-                message_data = {
-                    "chat_id": chat_id,
-                    "timestamp": timestamp,
+                message = DBMessage(
+                    chat_id=chat_id,
+                    message_text=message_text,
+                    timestamp=timestamp,
                     **extracted_data
-                }
-                messages_collection.insert_one(message_data)
+                )
+                session.add(message)
+                session.commit()
                 logger.info(f"Processed message from chat {chat_id}")
 
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
+                session.rollback()
 
     def start_processing(self, num_threads: int = 3):
         for _ in range(num_threads):
